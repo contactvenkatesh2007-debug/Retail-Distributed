@@ -20,9 +20,33 @@ class ProductController extends Controller
     }
 
     /**
-     * List all products
+     * List all products (Web View)
      */
-    public function index(Request $request): JsonResponse
+    public function index(Request $request)
+    {
+        if ($request->wantsJson() || $request->expectsJson()) {
+            return $this->indexApi($request);
+        }
+
+        $page = $request->input('page', 1);
+        $perPage = 20;
+        $category = $request->input('category');
+
+        $query = DB::table('products')->where('status', 'active');
+
+        if ($category) {
+            $query->where('category', $category);
+        }
+
+        $products = $query->orderBy('created_at', 'desc')->paginate($perPage);
+
+        return view('products.index', compact('products'));
+    }
+
+    /**
+     * List all products (API)
+     */
+    public function indexApi(Request $request): JsonResponse
     {
         $cacheKey = 'products_' . md5(json_encode($request->all()));
         
