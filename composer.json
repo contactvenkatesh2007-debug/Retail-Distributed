@@ -10,7 +10,10 @@
         "aws/aws-sdk-php": "^3.365",
         "guzzlehttp/guzzle": "^7.10",
         "laravel/framework": "^12.41",
-        "laravel/tinker": "^2.10.1"
+        "laravel/tinker": "^2.10.1",
+        "predis/predis": "^2.2",
+        "laravel/horizon": "^5.28",
+        "laravel/sanctum": "^4.0"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",

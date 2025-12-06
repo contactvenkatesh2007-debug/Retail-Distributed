@@ -1,0 +1,64 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  MYSQL_DATABASE: retail_test
+  MYSQL_ROOT_PASSWORD: root
+  DOCKER_DRIVER: overlay2
+
+before_script:
+  - apt-get update -qq && apt-get install -y -qq git curl libpng-dev libonig-dev libxml2-dev zip unzip
+  - docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd
+  - curl -sS https://getcomposer.org/installer | php
+  - php composer.phar install --prefer-dist --no-progress --no-interaction
+  - cp .env.example .env
+  - php artisan key:generate
+
+test:
+  stage: test
+  image: php:8.2
+  services:
+    - mysql:8.0
+    - redis:7-alpine
+  variables:
+    DB_CONNECTION: mysql
+    DB_HOST: mysql
+    DB_DATABASE: retail_test
+    DB_USERNAME: root
+    DB_PASSWORD: root
+    REDIS_HOST: redis
+  script:
+    - php artisan migrate --force
+    - php artisan test
+  coverage: '/Code Coverage: \d+\.\d+%\./'
+
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE/api-gateway:$CI_COMMIT_REF_SLUG -t $CI_REGISTRY_IMAGE/api-gateway:latest .
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker push $CI_REGISTRY_IMAGE/api-gateway:$CI_COMMIT_REF_SLUG
+    - docker push $CI_REGISTRY_IMAGE/api-gateway:latest
+  only:
+    - main
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST "cd /var/www/retail && git pull && docker-compose pull && docker-compose up -d"
+  only:
+    - main
+  when: manual
+
