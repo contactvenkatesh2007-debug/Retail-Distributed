@@ -25,7 +25,7 @@ jobs:
           MYSQL_DATABASE: RetailDB
         ports:
           - 3306:3306
-        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+        options: --health-cmd="mysqladmin ping -u root -pStrongPassword@123" --health-interval=10s --health-timeout=5s --health-retries=5
       
       redis:
         image: redis:7-alpine
@@ -55,6 +55,33 @@ jobs:
             echo "⚠️ Composer update had issues, trying install..."
             composer install --prefer-dist --no-progress --no-interaction --no-scripts || true
           }
+
+      - name: Install MySQL Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client
+
+      - name: Setup MySQL Database and User
+        run: |
+          echo "🗄️ Setting up MySQL database and user..."
+          echo "⏳ Waiting for MySQL to be ready..."
+          until mysql -h 127.0.0.1 -P 3306 -u root -pStrongPassword@123 -e "SELECT 1" &>/dev/null; do
+            echo "Waiting for MySQL..."
+            sleep 2
+          done
+          echo "✅ MySQL is ready"
+          
+          mysql -h 127.0.0.1 -P 3306 -u root -pStrongPassword@123 << 'EOF'
+          CREATE DATABASE IF NOT EXISTS RetailDB;
+          DROP USER IF EXISTS 'laravel_user'@'%';
+          CREATE USER 'laravel_user'@'%' IDENTIFIED BY 'StrongPassword@123';
+          GRANT ALL PRIVILEGES ON RetailDB.* TO 'laravel_user'@'%';
+          FLUSH PRIVILEGES;
+          SELECT 'Database and user created successfully' AS status;
+          EOF
+          echo "✅ Database and user setup complete"
+        env:
+          MYSQL_PWD: StrongPassword@123
 
       - name: Generate Application Key
         run: php artisan key:generate
