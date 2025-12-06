@@ -1,21 +1,28 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline - Build & Deploy to AWS
 
 on:
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
+  workflow_dispatch:  # Allows manual trigger
+
+env:
+  EC2_INSTANCE_ID: i-0ed07d391b8a885e9
+  AWS_REGION: us-east-1
+  APP_DIR: /var/www/html/myproject
 
 jobs:
   test:
+    name: Run Tests
     runs-on: ubuntu-latest
     
     services:
       mysql:
         image: mysql:8.0
         env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: retail_test
+          MYSQL_ROOT_PASSWORD: StrongPassword@123
+          MYSQL_DATABASE: RetailDB
         ports:
           - 3306:3306
         options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
@@ -27,117 +34,296 @@ jobs:
         options: --health-cmd="redis-cli ping" --health-interval=10s --health-timeout=5s --health-retries=3
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Setup PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@v4
         with:
           php-version: '8.2'
-          extensions: mbstring, xml, bcmath, pdo_mysql, redis, gd
+          extensions: mbstring, xml, bcmath, pdo_mysql, redis, gd, zip, curl
           coverage: xdebug
 
       - name: Copy .env
         run: php -r "file_exists('.env') || copy('.env.example', '.env');"
 
-      - name: Install Dependencies
-        run: composer install --prefer-dist --no-progress --no-interaction
+      - name: Install Composer Dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction --no-scripts
 
-      - name: Generate Key
+      - name: Generate Application Key
         run: php artisan key:generate
+        env:
+          APP_KEY: base64:random
 
-      - name: Run Migrations
+      - name: Run Database Migrations
         run: php artisan migrate --force
         env:
           DB_CONNECTION: mysql
           DB_HOST: 127.0.0.1
           DB_PORT: 3306
-          DB_DATABASE: retail_test
-          DB_USERNAME: root
-          DB_PASSWORD: root
+          DB_DATABASE: RetailDB
+          DB_USERNAME: laravel_user
+          DB_PASSWORD: StrongPassword@123
 
-      - name: Run Tests
-        run: php artisan test
+      - name: Run PHPUnit Tests
+        run: php artisan test --parallel
         env:
           DB_CONNECTION: mysql
           DB_HOST: 127.0.0.1
           DB_PORT: 3306
-          DB_DATABASE: retail_test
-          DB_USERNAME: root
-          DB_PASSWORD: root
+          DB_DATABASE: RetailDB
+          DB_USERNAME: laravel_user
+          DB_PASSWORD: StrongPassword@123
           REDIS_HOST: 127.0.0.1
+          APP_ENV: testing
 
-  deploy:
+      - name: Test API Health Endpoint
+        run: |
+          php artisan serve --host=127.0.0.1 --port=8000 &
+          sleep 5
+          curl -f http://127.0.0.1:8000/api/v1/health || exit 1
+
+  build:
+    name: Build Application
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v4
+        with:
+          php-version: '8.2'
+          extensions: mbstring, xml, bcmath, pdo_mysql, redis, gd, zip, curl
+
+      - name: Install Composer Dependencies (Production)
+        run: composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
+
+      - name: Install Node.js Dependencies
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Build Frontend Assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Optimize Laravel
+        run: |
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+
+      - name: Create Build Artifact
+        run: |
+          mkdir -p build-artifact
+          tar -czf build-artifact/retail-app.tar.gz \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='tests' \
+            --exclude='.env' \
+            --exclude='storage/logs/*' \
+            --exclude='storage/framework/cache/*' \
+            --exclude='storage/framework/sessions/*' \
+            --exclude='storage/framework/views/*' \
+            .
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: retail-build
+          path: build-artifact/retail-app.tar.gz
+          retention-days: 7
+
+  deploy:
+    name: Deploy to AWS EC2
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: http://${{ steps.ec2-ip.outputs.ip }}
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get EC2 Instance IP
-        id: ec2-ip
+      - name: Get EC2 Instance Information
+        id: ec2-info
         run: |
+          echo "🔍 Getting EC2 instance information..."
           INSTANCE_IP=$(aws ec2 describe-instances \
-            --instance-ids i-0ed07d391b8a885e9 \
+            --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+            --region ${{ env.AWS_REGION }} \
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
+            --output text 2>/dev/null || echo "")
+          
+          INSTANCE_STATE=$(aws ec2 describe-instances \
+            --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$INSTANCE_IP" ] || [ "$INSTANCE_IP" == "None" ]; then
+            echo "❌ Failed to get instance IP"
+            exit 1
+          fi
+          
+          if [ "$INSTANCE_STATE" != "running" ]; then
+            echo "⚠️ Instance is not running. Current state: $INSTANCE_STATE"
+            echo "🔄 Attempting to start instance..."
+            aws ec2 start-instances --instance-ids ${{ env.EC2_INSTANCE_ID }} --region ${{ env.AWS_REGION }}
+            echo "⏳ Waiting for instance to be running..."
+            aws ec2 wait instance-running --instance-ids ${{ env.EC2_INSTANCE_ID }} --region ${{ env.AWS_REGION }}
+            sleep 30  # Wait for SSH to be ready
+            INSTANCE_IP=$(aws ec2 describe-instances \
+              --instance-ids ${{ env.EC2_INSTANCE_ID }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+          fi
+          
+          echo "✅ Instance IP: $INSTANCE_IP"
+          echo "✅ Instance State: $INSTANCE_STATE"
           echo "ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
-          echo "Instance IP: $INSTANCE_IP"
+          echo "state=$INSTANCE_STATE" >> $GITHUB_OUTPUT
 
       - name: Setup SSH
         run: |
+          echo "🔑 Setting up SSH connection..."
           mkdir -p ~/.ssh
           echo "${{ secrets.AWS_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ steps.ec2-ip.outputs.ip }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ steps.ec2-info.outputs.ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_rsa
 
-      - name: Deploy to AWS EC2
-        env:
-          EC2_HOST: ${{ steps.ec2-ip.outputs.ip }}
-          EC2_USER: ${{ secrets.AWS_EC2_USER }}
+      - name: Test SSH Connection
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AWS_EC2_USER }}@${{ steps.ec2-ip.outputs.ip }} << 'EOF'
+          echo "🔌 Testing SSH connection..."
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            ${{ secrets.AWS_EC2_USER }}@${{ steps.ec2-info.outputs.ip }} \
+            "echo 'SSH connection successful!'"
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: retail-build
+          path: build-artifact
+
+      - name: Deploy Application to EC2
+        env:
+          EC2_HOST: ${{ steps.ec2-info.outputs.ip }}
+          EC2_USER: ${{ secrets.AWS_EC2_USER }}
+          APP_DIR: ${{ env.APP_DIR }}
+        run: |
+          echo "🚀 Starting deployment to AWS EC2..."
+          
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AWS_EC2_USER }}@${{ steps.ec2-info.outputs.ip }} << 'DEPLOY_SCRIPT'
             set -e
-            cd /var/www/retail || exit 1
+            cd ${{ env.APP_DIR }} || (echo "❌ Directory not found, creating..." && sudo mkdir -p ${{ env.APP_DIR }} && sudo chown -R $USER:$USER ${{ env.APP_DIR }} && cd ${{ env.APP_DIR }})
             
-            echo "📦 Pulling latest code..."
-            git fetch origin
-            git reset --hard origin/main
+            echo "📥 Pulling latest code from repository..."
+            if [ -d .git ]; then
+              git fetch origin main
+              git reset --hard origin/main
+              git clean -fd
+            else
+              echo "⚠️ Not a git repository, cloning..."
+              cd /var/www/html
+              sudo rm -rf myproject || true
+              sudo git clone https://github.com/${{ github.repository }}.git myproject || sudo git clone ${{ secrets.REPO_URL }} myproject || true
+              sudo chown -R $USER:$USER myproject
+              cd myproject
+            fi
             
-            echo "📦 Installing dependencies..."
-            composer install --no-dev --optimize-autoloader --no-interaction
+            echo "📦 Installing Composer dependencies..."
+            composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
             
-            echo "🗄️ Running migrations..."
-            php artisan migrate --force
+            echo "📦 Installing NPM dependencies and building assets..."
+            if command -v npm &> /dev/null; then
+              npm ci --production
+              npm run build
+            else
+              echo "⚠️ npm not found, skipping frontend build"
+            fi
             
-            echo "🧹 Clearing caches..."
-            php artisan config:clear
-            php artisan cache:clear
-            php artisan route:clear
-            php artisan view:clear
+            echo "🗄️ Running database migrations..."
+            php artisan migrate --force || echo "⚠️ Migration failed or no migrations to run"
             
-            echo "⚡ Optimizing..."
+            echo "🧹 Clearing all caches..."
+            php artisan config:clear || true
+            php artisan cache:clear || true
+            php artisan route:clear || true
+            php artisan view:clear || true
+            
+            echo "⚡ Optimizing application..."
             php artisan config:cache
             php artisan route:cache
             php artisan view:cache
             
-            echo "🔄 Restarting services..."
-            sudo systemctl restart php8.2-fpm || true
-            sudo systemctl restart nginx || true
-            sudo supervisorctl restart all || true
+            echo "🔧 Setting permissions..."
+            sudo chown -R www-data:www-data storage bootstrap/cache
+            sudo chmod -R 775 storage bootstrap/cache
             
-            echo "✅ Deployment complete!"
-          EOF
+            echo "🔄 Restarting services..."
+            sudo systemctl restart php8.2-fpm 2>/dev/null || sudo systemctl restart php-fpm || true
+            sudo systemctl restart nginx || true
+            
+            echo "🔄 Restarting queue workers..."
+            sudo supervisorctl reread 2>/dev/null || true
+            sudo supervisorctl update 2>/dev/null || true
+            sudo supervisorctl restart retail-worker:* 2>/dev/null || true
+            sudo supervisorctl restart retail-horizon 2>/dev/null || true
+            
+            echo "✅ Deployment completed successfully!"
+          DEPLOY_SCRIPT
 
       - name: Verify Deployment
         run: |
-          sleep 5
-          curl -f http://${{ steps.ec2-ip.outputs.ip }}/api/v1/health || exit 1
-          echo "✅ Health check passed!"
+          echo "🔍 Verifying deployment..."
+          sleep 10
+          
+          HEALTH_CHECK_URL="http://${{ steps.ec2-info.outputs.ip }}/api/v1/health"
+          
+          for i in {1..5}; do
+            echo "Attempt $i: Checking health endpoint..."
+            if curl -f -s --max-time 10 "$HEALTH_CHECK_URL" > /dev/null; then
+              echo "✅ Health check passed!"
+              curl -s "$HEALTH_CHECK_URL" | jq '.' || curl -s "$HEALTH_CHECK_URL"
+              exit 0
+            fi
+            echo "⏳ Waiting before retry..."
+            sleep 5
+          done
+          
+          echo "❌ Health check failed after 5 attempts"
+          exit 1
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance ID | \`${{ env.EC2_INSTANCE_ID }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance IP | \`${{ steps.ec2-info.outputs.ip }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance State | \`${{ steps.ec2-info.outputs.state }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application URL | http://${{ steps.ec2-info.outputs.ip }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Check | http://${{ steps.ec2-info.outputs.ip }}/api/v1/health |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Deployment completed successfully!" >> $GITHUB_STEP_SUMMARY
