@@ -66,7 +66,7 @@ jobs:
           DB_PASSWORD: root
           REDIS_HOST: 127.0.0.1
 
-  build:
+  deploy:
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
@@ -74,41 +74,70 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
 
-      - name: Build and push API Gateway
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: ${{ secrets.DOCKER_USERNAME }}/retail-api-gateway:latest
+      - name: Get EC2 Instance IP
+        id: ec2-ip
+        run: |
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --instance-ids i-0ed07d391b8a885e9 \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          echo "Instance IP: $INSTANCE_IP"
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AWS_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ steps.ec2-ip.outputs.ip }} >> ~/.ssh/known_hosts
 
-    steps:
       - name: Deploy to AWS EC2
-        uses: appleboy/ssh-action@v0.1.5
-        with:
-          host: ${{ secrets.AWS_EC2_HOST }}
-          username: ${{ secrets.AWS_EC2_USER }}
-          key: ${{ secrets.AWS_EC2_SSH_KEY }}
-          script: |
-            cd /var/www/retail
-            git pull origin main
-            docker-compose down
-            docker-compose pull
-            docker-compose up -d
-            docker-compose exec -T api-gateway php artisan migrate --force
-            docker-compose exec -T api-gateway php artisan config:cache
-            docker-compose exec -T api-gateway php artisan route:cache
+        env:
+          EC2_HOST: ${{ steps.ec2-ip.outputs.ip }}
+          EC2_USER: ${{ secrets.AWS_EC2_USER }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AWS_EC2_USER }}@${{ steps.ec2-ip.outputs.ip }} << 'EOF'
+            set -e
+            cd /var/www/retail || exit 1
+            
+            echo "📦 Pulling latest code..."
+            git fetch origin
+            git reset --hard origin/main
+            
+            echo "📦 Installing dependencies..."
+            composer install --no-dev --optimize-autoloader --no-interaction
+            
+            echo "🗄️ Running migrations..."
+            php artisan migrate --force
+            
+            echo "🧹 Clearing caches..."
+            php artisan config:clear
+            php artisan cache:clear
+            php artisan route:clear
+            php artisan view:clear
+            
+            echo "⚡ Optimizing..."
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
+            
+            echo "🔄 Restarting services..."
+            sudo systemctl restart php8.2-fpm || true
+            sudo systemctl restart nginx || true
+            sudo supervisorctl restart all || true
+            
+            echo "✅ Deployment complete!"
+          EOF
 
+      - name: Verify Deployment
+        run: |
+          sleep 5
+          curl -f http://${{ steps.ec2-ip.outputs.ip }}/api/v1/health || exit 1
+          echo "✅ Health check passed!"
