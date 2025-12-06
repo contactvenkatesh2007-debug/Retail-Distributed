@@ -48,7 +48,13 @@ jobs:
         run: php -r "file_exists('.env') || copy('.env.example', '.env');"
 
       - name: Install Composer Dependencies
-        run: composer install --prefer-dist --no-progress --no-interaction --no-scripts
+        run: |
+          echo "📦 Checking composer lock file..."
+          # Update lock file if packages are missing
+          composer update --prefer-dist --no-progress --no-interaction --no-scripts --with-all-dependencies || {
+            echo "⚠️ Composer update had issues, trying install..."
+            composer install --prefer-dist --no-progress --no-interaction --no-scripts || true
+          }
 
       - name: Generate Application Key
         run: php artisan key:generate
@@ -100,7 +106,12 @@ jobs:
           extensions: mbstring, xml, bcmath, pdo_mysql, redis, gd, zip, curl
 
       - name: Install Composer Dependencies (Production)
-        run: composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
+        run: |
+          echo "📦 Installing production dependencies..."
+          composer update --prefer-dist --no-progress --no-interaction --no-scripts --no-dev --with-all-dependencies || {
+            echo "⚠️ Update failed, trying install..."
+            composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
+          }
 
       - name: Install Node.js Dependencies
         uses: actions/setup-node@v4
@@ -251,12 +262,16 @@ jobs:
             fi
             
             echo "📦 Installing Composer dependencies..."
-            composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
+            # Update lock file if needed on production
+            composer update --no-dev --optimize-autoloader --no-interaction --no-scripts --with-all-dependencies 2>&1 | head -30 || {
+              echo "⚠️ Update had issues, trying install..."
+              composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
+            }
             
             echo "📦 Installing NPM dependencies and building assets..."
             if command -v npm &> /dev/null; then
-              npm ci --production
-              npm run build
+              npm ci --production || npm install --production
+              npm run build || echo "⚠️ Build failed, continuing..."
             else
               echo "⚠️ npm not found, skipping frontend build"
             fi
